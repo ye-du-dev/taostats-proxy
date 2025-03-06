@@ -17,6 +17,8 @@ API_CONFIG = {
     }
 }
 
+RAO = 10**9
+
 # Cache settings
 cache = {}  # Dictionary to store TTLCache per netuid
 cache_lock = threading.Lock()  # Lock to prevent simultaneous cache access
@@ -40,12 +42,13 @@ def fetch_all_neurons(netuid=16):
         
         # Format neuron data to match expected output
         neurons_data = []
+
         for i in range(len(metagraph.neurons)):
             neuron = {
                 "uid": int(metagraph.uids[i]),
-                "dailyReward": float(metagraph.emission[i] * 20),
-                "alphaStake": float(metagraph.S[i]),
-                "stake": float(metagraph.total_stake[i]),
+                "dailyReward": int(metagraph.emission[i] * 20 * RAO),
+                "alphaStake": int(metagraph.S[i] * RAO),
+                "stake": float(metagraph.total_stake[i] * RAO),
                 "coldkey": str(metagraph.coldkeys[i]),
                 "hotkey": str(metagraph.hotkeys[i])
             }
