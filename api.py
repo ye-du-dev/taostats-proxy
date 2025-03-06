@@ -46,8 +46,8 @@ def fetch_all_neurons(netuid=16):
         for i in range(len(metagraph.neurons)):
             neuron = {
                 "uid": int(metagraph.uids[i]),
-                "dailyReward": int(metagraph.emission[i] * 20 * RAO),
-                "alphaStake": int(metagraph.S[i] * RAO),
+                "daily_reward": int(metagraph.emission[i] * 20 * RAO),
+                "alpha_stake": int(metagraph.S[i] * RAO),
                 "stake": float(metagraph.total_stake[i] * RAO),
                 "coldkey": str(metagraph.coldkeys[i]),
                 "hotkey": str(metagraph.hotkeys[i])
