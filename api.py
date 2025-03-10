@@ -1,12 +1,37 @@
 import os
 import time
-import threading
-from flask import Flask, jsonify, request
+import asyncio
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 from cachetools import TTLCache
 import bittensor as bt
-import requests
+import httpx
+from typing import Annotated, Dict, List, Optional, Generator, AsyncGenerator
 
-app = Flask(__name__)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize subtensor
+    subtensor = bt.AsyncSubtensor(network="finney")
+    await subtensor.initialize()
+    app.state.subtensor = subtensor
+
+    # Start background task
+    price_task = asyncio.create_task(price_refresh_loop())
+    
+    yield
+    
+    # Cleanup
+    price_task.cancel()
+    try:
+        await price_task
+    except asyncio.CancelledError:
+        pass
+    
+    # Close subtensor connection
+    await app.state.subtensor.close()
+
+app = FastAPI(lifespan=lifespan)
 
 # API Configuration
 API_CONFIG = {
@@ -20,37 +45,36 @@ API_CONFIG = {
 RAO = 10**9
 
 # Cache settings
-cache = {}  # Dictionary to store TTLCache per netuid
-cache_lock = threading.Lock()  # Lock to prevent simultaneous cache access
+cache: Dict[int, TTLCache] = {}  # Dictionary to store TTLCache per netuid
 global_price_cache = TTLCache(maxsize=1, ttl=120)  # Separate cache for price
 
-def get_cache(netuid):
+def get_cache(netuid: int) -> TTLCache:
     """Get or create a cache for the specified netuid."""
-    with cache_lock:
-        if netuid not in cache:
-            cache[netuid] = TTLCache(maxsize=100, ttl=120)
-        return cache[netuid]
+    if netuid not in cache:
+        cache[netuid] = TTLCache(maxsize=100, ttl=120)
+    return cache[netuid]
 
-def fetch_all_neurons(netuid=16):
+def get_subtensor(request: Request) -> bt.AsyncSubtensor:
+    """Get the subtensor instance from app state."""
+    return request.app.state.subtensor
+
+async def fetch_all_neurons(subtensor: bt.AsyncSubtensor, netuid: int = 16) -> Dict:
     """Fetch neuron list using Bittensor SDK."""
     try:
-        # Initialize subtensor connection
-        subtensor = bt.subtensor(network="finney")
-        
         # Get metagraph for the specified netuid
-        metagraph = bt.metagraph(netuid=netuid, subtensor=subtensor)
+        info = await subtensor.get_metagraph_info(netuid)
         
         # Format neuron data to match expected output
         neurons_data = []
 
-        for i in range(len(metagraph.neurons)):
+        for i in range(info.num_uids):
             neuron = {
-                "uid": int(metagraph.uids[i]),
-                "daily_reward": int(metagraph.emission[i] * 20 * RAO),
-                "alpha_stake": int(metagraph.S[i] * RAO),
-                "stake": float(metagraph.total_stake[i] * RAO),
-                "coldkey": str(metagraph.coldkeys[i]),
-                "hotkey": str(metagraph.hotkeys[i])
+                "uid": i,
+                "daily_reward": int(info.emission[i].rao * 20),
+                "alpha_stake": int(info.alpha_stake[i].rao),
+                "stake": float(info.total_stake[i].rao),
+                "coldkey": str(info.coldkeys[i]),
+                "hotkey": str(info.hotkeys[i])
             }
             neurons_data.append(neuron)
             
@@ -59,117 +83,86 @@ def fetch_all_neurons(netuid=16):
         print(f"Error fetching neurons: {e}")
         return {"data": []}
 
-def fetch_price():
+async def fetch_price() -> Dict:
     """Fetch TAO price from CoinMarketCap API."""
     try:
-        url = f"{API_CONFIG['baseUrl']}/v1/cryptocurrency/quotes/latest"
-        params = {"symbol": "TAO"}
-        
-        response = requests.get(
-            url, 
-            headers=API_CONFIG["headers"], 
-            params=params,
-            timeout=10
-        )
-        response.raise_for_status()
-        
-        data = response.json()
-        quote_data = data["data"]["TAO"]["quote"]["USD"]
-        
-        return {
-            "data": [{
-                "price": quote_data["price"],
-                "market_cap": quote_data["market_cap"],
-                "circulating_supply": data["data"]["TAO"]["circulating_supply"]
-            }]
-        }
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{API_CONFIG['baseUrl']}/v1/cryptocurrency/quotes/latest",
+                headers=API_CONFIG["headers"],
+                params={"symbol": "TAO"},
+                timeout=10.0
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            quote_data = data["data"]["TAO"]["quote"]["USD"]
+            
+            return {
+                "data": [{
+                    "price": quote_data["price"],
+                    "market_cap": quote_data["market_cap"],
+                    "circulating_supply": data["data"]["TAO"]["circulating_supply"]
+                }]
+            }
     except Exception as e:
         print(f"Error fetching price from CMC: {e}")
         return {"data": [{"price": 0.0}]}
 
-def fetch_pool_data(netuid=16):
+async def fetch_pool_data(subtensor: bt.AsyncSubtensor, netuid: int = 16) -> Dict:
     """Calculate Alpha/TAO pool data using Bittensor SDK."""
     try:
-        subtensor = bt.subtensor(network="finney")
-        
         # Calculate total stake and rewards
-        subnets = subtensor.all_subnets()
+        subnet = await subtensor.subnet(netuid)
         
         # Calculate price (simplified)
-        price = subnets[netuid].price.tao
+        price = subnet.price.tao
         
         return {"data": [{"price": price}]}
     except Exception as e:
         print(f"Error fetching pool data: {e}")
         return {"data": [{"price": 0.0}]}
 
-@app.route("/api/metagraph/latest/v1", methods=["GET"])
-def neurons_proxy():
+@app.get("/api/metagraph/latest/v1")
+async def neurons_proxy(
+    subtensor: Annotated[bt.AsyncSubtensor, Depends(get_subtensor)],
+    netuid: int = 16
+):
     """Return neuron list from cache, fetch if missing."""
-    netuid = request.args.get("netuid", default=16, type=int)
     netuid_cache = get_cache(netuid)
-
-    with cache_lock:
-        if "neurons" not in netuid_cache:
-            netuid_cache["neurons"] = fetch_all_neurons(netuid)
-
-    return jsonify(netuid_cache["neurons"])
-
-@app.route("/api/price/latest/v1", methods=["GET"])
-def price_proxy():
-    """Return price from cache if available, otherwise fetch a new price."""
-    with cache_lock:
-        if "price" not in global_price_cache:
-            global_price_cache["price"] = fetch_price()
     
-    return jsonify(global_price_cache["price"])
+    if "neurons" not in netuid_cache:
+        netuid_cache["neurons"] = await fetch_all_neurons(subtensor, netuid)
 
-@app.route("/api/dtao/pool/v1", methods=["GET"])
-def pool_proxy():
+    return netuid_cache["neurons"]
+
+@app.get("/api/price/latest/v1")
+async def price_proxy():
+    """Return price from cache if available, otherwise fetch a new price."""
+    if "price" not in global_price_cache:
+        global_price_cache["price"] = await fetch_price()
+    
+    return global_price_cache["price"]
+
+@app.get("/api/dtao/pool/v1")
+async def pool_proxy(
+    subtensor: Annotated[bt.AsyncSubtensor, Depends(get_subtensor)],
+    netuid: int = 16
+):
     """Return pool data from cache, fetch if missing."""
-    netuid = request.args.get("netuid", default=16, type=int)
     netuid_cache = get_cache(netuid)
+    
+    if "pool_data" not in netuid_cache:
+        netuid_cache["pool_data"] = await fetch_pool_data(subtensor, netuid)
 
-    with cache_lock:
-        if "pool_data" not in netuid_cache:
-            netuid_cache["pool_data"] = fetch_pool_data(netuid)
+    return netuid_cache["pool_data"]
 
-    return jsonify(netuid_cache["pool_data"])
-
-@app.route("/force-refresh", methods=["POST"])
-def force_refresh():
-    """Manually refresh the cache for a given netuid."""
-    netuid = request.args.get("netuid", default=16, type=int)
-    netuid_cache = get_cache(netuid)
-
-    with cache_lock:
-        netuid_cache["neurons"] = fetch_all_neurons(netuid)
-        netuid_cache["pool_data"] = fetch_pool_data(netuid)
-        global_price_cache["price"] = fetch_price()
-
-    return jsonify({"message": f"Cache refreshed for netuid {netuid}"})
-
-@app.route("/cache-status", methods=["GET"])
-def cache_status():
-    """Check cache status for a given netuid."""
-    netuid = request.args.get("netuid", default=16, type=int)
-    netuid_cache = cache.get(netuid, {})
-
-    with cache_lock:
-        return jsonify({
-            "neurons_cached": "neurons" in netuid_cache,
-            "price_cached": "price" in global_price_cache,
-            "pool_data_cached": "pool_data" in netuid_cache,
-        })
-
-def price_refresh_loop():
-    """Background thread to refresh price every 60 seconds."""
+async def price_refresh_loop():
+    """Background task to refresh price every 60 seconds."""
     while True:
-        with cache_lock:
-            global_price_cache["price"] = fetch_price()
-        time.sleep(60)
+        global_price_cache["price"] = await fetch_price()
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    # Start background price refresher thread
-    threading.Thread(target=price_refresh_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=8000) 
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000) 
